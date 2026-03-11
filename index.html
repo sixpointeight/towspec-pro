@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>TowSpec Pro | Recovery Database</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@ericblade/quagga2/dist/quagga.min.js"></script>
+    <style>
+        #interactive.viewport {
+            width: 100%;
+            height: 300px;
+            position: relative;
+            overflow: hidden;
+            background: #000;
+            border: 4px solid #334155;
+            border-radius: 12px;
+        }
+        #interactive.viewport video, #interactive.viewport canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .drawingBuffer { position: absolute; top: 0; left: 0; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900 pb-10">
+
+    <nav class="bg-slate-900 text-white p-5 shadow-xl sticky top-0 z-50">
+        <div class="container mx-auto flex justify-between items-center">
+            <div>
+                <h1 class="text-2xl font-black tracking-tighter">TOWSPEC <span class="text-yellow-400">PRO</span></h1>
+                <p class="text-[10px] uppercase tracking-widest text-slate-400">Roadside Assistance Database</p>
+            </div>
+            <div class="bg-yellow-500 text-slate-900 text-xs font-bold px-2 py-1 rounded">OFFLINE READY</div>
+        </div>
+    </nav>
+
+    <main class="container mx-auto p-4 max-w-2xl">
+        
+        <div class="grid grid-cols-1 gap-3 mb-6">
+            <button onclick="startScanner()" id="btn-scan" class="bg-blue-600 hover:bg-blue-700 text-white py-4 rounded-xl font-bold shadow-lg flex items-center justify-center gap-2 transition-all active:scale-95">
+                <span>📷</span> SCAN VIN BARCODE
+            </button>
+            <div class="relative">
+                <input type="text" id="manualVin" placeholder="Enter 17-digit VIN manually..." class="w-full p-4 border-2 border-slate-200 rounded-xl focus:border-blue-500 outline-none uppercase font-mono">
+                <button onclick="handleManualVin()" class="absolute right-2 top-2 bg-slate-800 text-white px-4 py-2 rounded-lg font-bold">GO</button>
+            </div>
+        </div>
+
+        <div id="scanner-container" class="hidden mb-6 animate-in fade-in duration-500">
+            <div class="flex justify-between items-center mb-2">
+                <h3 class="font-bold text-slate-700">Align Barcode in Window</h3>
+                <button onclick="stopScanner()" class="text-red-500 font-bold px-2">Close X</button>
+            </div>
+            <div id="interactive" class="viewport"></div>
+            <p class="text-xs text-center text-slate-500 mt-2 italic font-medium">Scanning for Code 128 / Code 39...</p>
+        </div>
+
+        <div id="results-area" class="space-y-4">
+            <div id="placeholder" class="text-center py-20 border-2 border-dashed border-slate-300 rounded-3xl text-slate-400">
+                <p>Scan a vehicle or enter VIN<br>to see towing procedures.</p>
+            </div>
+        </div>
+
+    </main>
+
+    <script>
+        /**
+         * 1. INTERNAL DATABASE
+         * In a real app, you would fetch this from a server or JSON file.
+         */
+        const towingDatabase = [
+            {
+                make: "JAGUAR",
+                model: "I-PACE",
+                neutral: "Turn ignition ON. Press Brake. Pull the Emergency Release Lever located in the left-hand footwell (behind a small plastic cover). Dash will confirm 'N'.",
+                tiedown: "Front: Use screw-in recovery eye found in tool kit. Rear: Use designated slots in the rear subframe.",
+                notes: "AWD Electric. DO NOT tow on wheels. Flatbed ONLY.",
+                warning: "High Voltage System present."
+            },
+            {
+                make: "TESLA",
+                model: "MODEL 3",
+                neutral: "Controls > Service > Tow Mode. Note: Car must be in Park and brake pressed.",
+                tiedown: "Use only the front recovery eye. Do not secure via suspension arms.",
+                notes: "AWD/RWD. Permanent magnet motors. 0mph towing limit.",
+                warning: "Risk of motor damage if wheels rotate."
+            }
+        ];
+
+        /**
+         * 2. SCANNER LOGIC
+         */
+        function startScanner() {
+            document.getElementById('scanner-container').classList.remove('hidden');
+            document.getElementById('placeholder').classList.add('hidden');
+            
+            Quagga.init({
+                inputStream: {
+                    name: "Live",
+                    type: "LiveStream",
+                    target: document.querySelector('#interactive'),
+                    constraints: { facingMode: "environment" }
+                },
+                decoder: { readers: ["code_128_reader", "code_39_reader"] }
+            }, (err) => {
+                if (err) { alert("Camera error: " + err); return; }
+                Quagga.start();
+            });
+
+            Quagga.onDetected((data) => {
+                const vin = data.codeResult.code;
+                if (vin.length === 17) {
+                    stopScanner();
+                    processVin(vin);
+                }
+            });
+        }
+
+        function stopScanner() {
+            Quagga.stop();
+            document.getElementById('scanner-container').classList.add('hidden');
+        }
+
+        function handleManualVin() {
+            const vin = document.getElementById('manualVin').value.trim();
+            if (vin.length === 17) {
+                processVin(vin);
+            } else {
+                alert("Please enter a valid 17-digit VIN.");
+            }
+        }
+
+        /**
+         * 3. DATA PROCESSING (NHTSA API + INTERNAL DB)
+         */
+        async function processVin(vin) {
+            const resultsArea = document.getElementById('results-area');
+            resultsArea.innerHTML = `<div class="text-center py-10 font-bold text-blue-600 animate-pulse text-lg">DECODING VIN...</div>`;
+
+            try {
+                // Fetch from NHTSA
+                const response = await fetch(`https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/${vin}?format=json`);
+                const data = await response.json();
+                const vInfo = data.Results[0];
+
+                // Look for procedure in our internal list
+                const procedure = towingDatabase.find(p => 
+                    p.make === vInfo.Make.toUpperCase() && 
+                    vInfo.Model.toUpperCase().includes(p.model)
+                );
+
+                renderResult(vInfo, procedure, vin);
+            } catch (error) {
+                resultsArea.innerHTML = `<div class="bg-red-100 p-4 text-red-700 rounded-lg">Error connecting to database. Please check connection.</div>`;
+            }
+        }
+
+        function renderResult(vInfo, procedure, vin) {
+            const resultsArea = document.getElementById('results-area');
+            
+            // Build Procedure UI
+            const procedureHTML = procedure 
+                ? `
+                <div class="bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+                    <h3 class="text-red-600 font-black text-lg border-b pb-2 mb-3 tracking-tight">🚨 NEUTRAL PROCEDURE</h3>
+                    <p class="text-slate-800 leading-relaxed font-medium">${procedure.neutral}</p>
+                    
+                    <h3 class="text-blue-600 font-black text-lg border-b pb-2 mb-3 mt-6 tracking-tight">⛓️ TIE-DOWN POINTS</h3>
+                    <p class="text-slate-800 leading-relaxed font-medium">${procedure.tiedown}</p>
+                    
+                    <div class="mt-6 p-4 bg-amber-50 rounded-xl border border-amber-200">
+                        <p class="text-xs font-bold text-amber-800 uppercase">Operator Warning:</p>
+                        <p class="text-sm text-amber-900">${procedure.notes}</p>
+                    </div>
+                </div>`
+                : `
+                <div class="bg-slate-200 p-8 rounded-2xl text-center">
+                    <p class="font-bold text-slate-600 italic">No specific procedure in database for this model.</p>
+                    <p class="text-xs text-slate-500 mt-2 uppercase font-bold tracking-widest">Default to Flatbed Recovery</p>
+                </div>`;
+
+            resultsArea.innerHTML = `
+                <div class="animate-in slide-in-from-bottom duration-500">
+                    <div class="bg-slate-900 text-white p-5 rounded-2xl mb-4">
+                        <p class="text-xs text-slate-400 font-mono mb-1">${vin}</p>
+                        <h2 class="text-2xl font-black italic tracking-tighter">${vInfo.ModelYear} ${vInfo.Make} ${vInfo.Model}</h2>
+                        <div class="flex gap-2 mt-2">
+                            <span class="bg-slate-700 text-[10px] px-2 py-1 rounded font-bold uppercase">${vInfo.DriveType || 'N/A'}</span>
+                            <span class="bg-slate-700 text-[10px] px-2 py-1 rounded font-bold uppercase">${vInfo.FuelTypePrimary || 'Unknown'}</span>
+                        </div>
+                    </div>
+                    ${procedureHTML}
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>
