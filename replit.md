@@ -1,31 +1,37 @@
 # TowSpec Pro | Recovery Database
 
 ## Overview
-A lightweight, mobile-friendly static web application for roadside assistance professionals. Users can scan a vehicle's VIN barcode or enter it manually to retrieve towing procedures, neutral engagement instructions, and tie-down points.
+A mobile-friendly web application for roadside assistance professionals. Scan or manually enter a vehicle VIN to get full AAA RSI towing procedures including tow information, shift interlock override, battery location, jump starting, lockout procedures, and more.
 
 ## Tech Stack
-- **Frontend:** Pure HTML5, CSS3, Vanilla JavaScript
-- **Styling:** Tailwind CSS (via CDN)
-- **Libraries:** Quagga2 (barcode/VIN scanning via camera)
-- **APIs:** NHTSA VIN decoder API (vpic.nhtsa.dot.gov)
-- **Build System:** None — pure static site, no build step required
+- **Backend:** Python + Flask (server.py) — authenticates with AAA RSI, proxies procedure requests
+- **Frontend:** Vanilla HTML/CSS/JS with Tailwind CSS (CDN) and Quagga2 (VIN barcode scanner)
+- **Vehicle Database:** vehicles.json — 16,218 vehicles from rsi.aaa.biz (year/make/model/drivetrain/fuelType/URL)
+- **External APIs:** NHTSA VIN decoder (public), AAA RSI procedures (requires credentials)
 
 ## Project Layout
-- `index.html` — Single-page application containing all UI and logic
-- `vehicles.json` — 16,218 vehicle records scraped from rsi.aaa.biz/procedures (year, make, model, drivetrain, fuelType, URL)
-- `netlify.toml` — Netlify security headers config (not used in Replit)
+- `server.py` — Flask backend: serves static files on port 5000, `/api/procedure` endpoint
+- `index.html` — Single-page frontend with scanner, VIN lookup, and procedure display
+- `vehicles.json` — 16,218 vehicle records scraped from rsi.aaa.biz/procedures sitemaps
+- `requirements.txt` — Python dependencies (flask, requests, beautifulsoup4)
 - `replit.md` — This file
 
-## Running the App
-The app is served via Python's built-in HTTP server on port 5000:
-```
-python3 -m http.server 5000 --bind 0.0.0.0
-```
+## Environment Secrets Required
+- `AAA_RSI_USERNAME` — AAA RSI account username
+- `AAA_RSI_PASSWORD` — AAA RSI account password
 
-## Features
-- VIN barcode scanning via device camera (Quagga2)
-- Manual 17-digit VIN entry
-- NHTSA API integration for vehicle make/model/year lookup
-- Internal towing procedures database (hardcoded JS array)
-- Offline-ready badge (service worker / PWA-style)
-- Mobile-first responsive design
+## Running the App
+```
+python3 server.py
+```
+Starts on port 5000. Logs in to AAA RSI at startup and maintains a session.
+
+## How It Works
+1. User enters/scans a 17-digit VIN
+2. NHTSA API decodes VIN → year, make, model, drivetrain, fuel type
+3. App searches local vehicles.json for matching AAA RSI records
+4. User selects a configuration variant (AWD/FWD/RWD + fuel type)
+5. Frontend calls `/api/procedure?url=...` on the Flask backend
+6. Backend fetches the authenticated AAA RSI page, parses procedure sections
+7. Sections displayed: Tow Information, Shift Interlock Override, Battery Location,
+   Jump Starting, Tire Service, Fuel Type, Fuel Delivery, Electronic Key, Lockout Procedures
