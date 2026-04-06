@@ -11,7 +11,8 @@ A lightweight, mobile-friendly static web application for roadside assistance pr
 - **Build System:** None — pure static site, no build step required
 
 ## Project Layout
-- `index.html` — Single-page application containing all UI, logic, and the internal towing database
+- `index.html` — Single-page application containing all UI and logic
+- `vehicles.json` — 16,218 vehicle records scraped from rsi.aaa.biz/procedures (year, make, model, drivetrain, fuelType, URL)
 - `netlify.toml` — Netlify security headers config (not used in Replit)
 - `replit.md` — This file
 
