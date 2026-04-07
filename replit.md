@@ -10,11 +10,20 @@ A mobile-friendly web application for roadside assistance professionals. Scan or
 - **External APIs:** NHTSA VIN decoder (public), AAA RSI procedures (requires credentials)
 
 ## Project Layout
-- `server.py` — Flask backend: serves static files on port 5000, `/api/procedure` endpoint
-- `index.html` — Single-page frontend with scanner, VIN lookup, and procedure display
+- `server.py` — Flask backend for Replit dev: serves static files on port 5000, `/api/procedure` endpoint
+- `netlify/functions/procedure.js` — Netlify serverless function (same logic, Node.js, no dependencies)
+- `netlify.toml` — Netlify config: redirects `/api/procedure` → function, sets publish dir
+- `index.html` — Single-page frontend (calls `/api/procedure` — works on both Replit and Netlify)
 - `vehicles.json` — 16,218 vehicle records scraped from rsi.aaa.biz/procedures sitemaps
 - `requirements.txt` — Python dependencies (flask, requests, beautifulsoup4)
 - `replit.md` — This file
+
+## Deploying to Netlify
+1. Push code to GitHub (vehicles.json must be committed — it's ~2.8MB)
+2. In Netlify dashboard → Site configuration → Environment variables, add:
+   - `AAA_RSI_USERNAME` = your AAA RSI username
+   - `AAA_RSI_PASSWORD` = your AAA RSI password
+3. Deploy — Netlify will auto-detect the `netlify.toml` and build/serve the function
 
 ## Environment Secrets Required
 - `AAA_RSI_USERNAME` — AAA RSI account username
