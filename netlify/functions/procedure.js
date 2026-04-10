@@ -29,11 +29,7 @@ function httpsGet(urlStr, cookieStr, extraHeaders = {}) {
     const req = https.request(options, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
-      res.on('end', () => resolve({
-        statusCode: res.statusCode,
-        headers: res.headers,
-        body: Buffer.concat(chunks).toString('utf8'),
-      }));
+      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
     });
     req.on('error', reject);
     req.setTimeout(25000, () => req.destroy(new Error('Timeout')));
@@ -63,11 +59,7 @@ function httpsPost(urlStr, postBody, cookieStr, extraHeaders = {}) {
     const req = https.request(options, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
-      res.on('end', () => resolve({
-        statusCode: res.statusCode,
-        headers: res.headers,
-        body: Buffer.concat(chunks).toString('utf8'),
-      }));
+      res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
     });
     req.on('error', reject);
     req.setTimeout(25000, () => req.destroy(new Error('Timeout')));
@@ -76,18 +68,16 @@ function httpsPost(urlStr, postBody, cookieStr, extraHeaders = {}) {
   });
 }
 
-// Extract all cookies from a Set-Cookie header array, respecting Max-Age=0 deletions
 function mergeCookies(existing, headers) {
   const raw = headers['set-cookie'] || [];
   const list = Array.isArray(raw) ? raw : [raw];
   const updated = Object.assign({}, existing);
   for (const c of list) {
     if (!c) continue;
-    const nameValMatch = c.match(/^([^=]+)=([^;]*)/);
-    if (!nameValMatch) continue;
-    const name = nameValMatch[1].trim();
-    const value = nameValMatch[2].trim();
-    // Respect Max-Age=0 or expired deletions — remove the cookie
+    const m = c.match(/^([^=]+)=([^;]*)/);
+    if (!m) continue;
+    const name = m[1].trim();
+    const value = m[2].trim();
     if (c.includes('Max-Age=0') || c.includes('max-age=0')) {
       delete updated[name];
     } else {
@@ -101,20 +91,17 @@ function jar2str(jar) {
   return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
-// Login and return only the cookies needed for authenticated page access
 async function login() {
-  // Step 1: GET login page
   const loginRes = await httpsGet(`${AAA_BASE}/my-account/`, '');
   let jar = mergeCookies({}, loginRes.headers);
 
   const dom = parseHtml(loginRes.body);
   const nonceEl = dom.querySelector('input[name="woocommerce-login-nonce"]');
-  if (!nonceEl) throw new Error('Login nonce not found on AAA RSI login page');
+  if (!nonceEl) throw new Error('Login nonce not found');
   const nonce = nonceEl.getAttribute('value');
   const refEl = dom.querySelector('input[name="_wp_http_referer"]');
   const referer = refEl ? refEl.getAttribute('value') : '/my-account/';
 
-  // Step 2: POST credentials — do NOT follow the redirect, just capture cookies
   const body = querystring.stringify({
     username: USERNAME,
     password: PASSWORD,
@@ -127,13 +114,9 @@ async function login() {
   const postRes = await httpsPost(`${AAA_BASE}/my-account/`, body, jar2str(jar), {
     Referer: `${AAA_BASE}/my-account/`,
   });
-
-  // Merge cookies from the 302 response — this is where the auth cookies arrive
   jar = mergeCookies(jar, postRes.headers);
 
-  // Only keep cookies that are actually needed:
-  // wordpress_logged_in_* (the main auth cookie, path=/) and fakesessid (path=/)
-  // Discard path-specific cookies (/wp-admin, /wp-content) and temp/switch cookies
+  // Send only the two cookies Python's CookieJar sends for path=/
   const essential = {};
   for (const [k, v] of Object.entries(jar)) {
     if (k.startsWith('wordpress_logged_in_') || k === 'fakesessid') {
@@ -141,8 +124,8 @@ async function login() {
     }
   }
 
-  if (!essential[Object.keys(essential).find(k => k.startsWith('wordpress_logged_in_'))]) {
-    throw new Error('Authentication failed — wordpress_logged_in cookie not received');
+  if (!Object.keys(essential).some(k => k.startsWith('wordpress_logged_in_'))) {
+    throw new Error('Auth cookie not received — check credentials');
   }
 
   return essential;
@@ -176,61 +159,8 @@ exports.handler = async (event) => {
   };
 
   const params = event.queryStringParameters || {};
-
-  // Debug endpoint
-  if (params.debug === '1') {
-    try {
-      const loginRes = await httpsGet(`${AAA_BASE}/my-account/`, '');
-      let jar = mergeCookies({}, loginRes.headers);
-      const dom = parseHtml(loginRes.body);
-      const nonceEl = dom.querySelector('input[name="woocommerce-login-nonce"]');
-      const nonce = nonceEl ? nonceEl.getAttribute('value') : null;
-      const refEl = dom.querySelector('input[name="_wp_http_referer"]');
-      const referer = refEl ? refEl.getAttribute('value') : '/my-account/';
-
-      const postBody = querystring.stringify({
-        username: USERNAME, password: PASSWORD,
-        'woocommerce-login-nonce': nonce, '_wp_http_referer': referer,
-        login: 'Log in', rememberme: 'forever',
-      });
-      const postRes = await httpsPost(`${AAA_BASE}/my-account/`, postBody, jar2str(jar), {
-        Referer: `${AAA_BASE}/my-account/`,
-      });
-      jar = mergeCookies(jar, postRes.headers);
-
-      // Filter to essential
-      const essential = {};
-      for (const [k, v] of Object.entries(jar)) {
-        if (k.startsWith('wordpress_logged_in_') || k === 'fakesessid') essential[k] = v;
-      }
-
-      const testUrl = `${AAA_BASE}/procedures/2025/Tesla/Model-3/RWD/Electric/2025-tesla-model-3-rwd-2/`;
-      const procRes = await httpsGet(testUrl, jar2str(essential), {
-        Referer: `${AAA_BASE}/procedures/`,
-      });
-
-      return {
-        statusCode: 200,
-        headers: responseHeaders,
-        body: JSON.stringify({
-          envVarsSet: { username: !!USERNAME, password: !!PASSWORD },
-          nonceFound: !!nonce,
-          postStatus: postRes.statusCode,
-          allCookieCount: Object.keys(jar).length,
-          essentialCookies: Object.keys(essential),
-          essentialCookieValueLengths: Object.fromEntries(Object.entries(essential).map(([k,v]) => [k, v.length])),
-          procedureStatus: procRes.statusCode,
-          isPaywalled: procRes.body.includes('paid subscriber') || procRes.body.includes('woocommerce-login-nonce'),
-          hasTowInfo: procRes.body.includes('Tow Information'),
-          bodySnippet: procRes.body.slice(0, 300).replace(/\s+/g,' '),
-        }, null, 2),
-      };
-    } catch (err) {
-      return { statusCode: 500, headers: responseHeaders, body: JSON.stringify({ debugError: err.message }) };
-    }
-  }
-
   const url = params.url || '';
+
   if (!url || !url.startsWith(`${AAA_BASE}/procedures/`)) {
     return { statusCode: 400, headers: responseHeaders, body: JSON.stringify({ error: 'Invalid URL' }) };
   }
