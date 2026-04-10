@@ -1,122 +1,72 @@
-const https = require('https');
-const http = require('http');
-const { URL } = require('url');
+// Uses Node.js 18+ built-in fetch — no external dependencies needed
+const { parse } = require('node-html-parser');
 
 const AAA_BASE = 'https://rsi.aaa.biz';
 const USERNAME = process.env.AAA_RSI_USERNAME || '';
 const PASSWORD = process.env.AAA_RSI_PASSWORD || '';
+const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1';
 
-// Make an HTTP/HTTPS request returning { body, headers, statusCode }
-function request(options, postData = null) {
-  return new Promise((resolve, reject) => {
-    const mod = options.protocol === 'http:' ? http : https;
-    const req = mod.request(options, (res) => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => resolve({ body, headers: res.headers, statusCode: res.statusCode }));
-    });
-    req.on('error', reject);
-    req.setTimeout(20000, () => { req.destroy(); reject(new Error('Timeout')); });
-    if (postData) req.write(postData);
-    req.end();
+function cookieString(jar) {
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function parseCookies(setCookieHeaders) {
+  const jar = {};
+  for (const c of setCookieHeaders) {
+    const m = c.match(/^([^=]+)=([^;]*)/);
+    if (m) jar[m[1].trim()] = m[2].trim();
+  }
+  return jar;
+}
+
+async function aaaFetch(url, options = {}, cookieJar = {}) {
+  const resp = await fetch(url, {
+    ...options,
+    redirect: 'manual',
+    headers: {
+      'User-Agent': UA,
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'en-US,en;q=0.9',
+      ...options.headers,
+      'Cookie': cookieString(cookieJar),
+    },
   });
-}
 
-// Follow redirects, maintaining cookies
-async function fetchWithCookies(urlStr, method = 'GET', postData = null, cookies = {}, extraHeaders = {}) {
-  const maxRedirects = 6;
-  let currentUrl = urlStr;
-  let redirectCount = 0;
+  // Merge any new cookies
+  const setCookies = resp.headers.getSetCookie ? resp.headers.getSetCookie() : [];
+  Object.assign(cookieJar, parseCookies(setCookies));
 
-  while (redirectCount < maxRedirects) {
-    const parsed = new URL(currentUrl);
-    const cookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join('; ');
-
-    const options = {
-      protocol: parsed.protocol,
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      method,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cookie': cookieHeader,
-        ...extraHeaders,
-        ...(postData ? { 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(postData) } : {}),
-      },
-    };
-
-    const res = await request(options, method === 'POST' ? postData : null);
-
-    // Collect Set-Cookie headers
-    const setCookie = res.headers['set-cookie'] || [];
-    for (const c of setCookie) {
-      const match = c.match(/^([^=]+)=([^;]*)/);
-      if (match) cookies[match[1].trim()] = match[2].trim();
+  // Follow redirects manually (so we capture cookies from each hop)
+  if ([301, 302, 303, 307, 308].includes(resp.status)) {
+    const location = resp.headers.get('location');
+    if (location) {
+      const nextUrl = new URL(location, url).toString();
+      const nextMethod = [307, 308].includes(resp.status) ? (options.method || 'GET') : 'GET';
+      const nextBody = nextMethod === 'GET' ? undefined : options.body;
+      return aaaFetch(nextUrl, { ...options, method: nextMethod, body: nextBody }, cookieJar);
     }
-
-    if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-      currentUrl = new URL(res.headers.location, currentUrl).toString();
-      method = res.statusCode === 307 || res.statusCode === 308 ? method : 'GET';
-      postData = method === 'GET' ? null : postData;
-      redirectCount++;
-      continue;
-    }
-
-    return { body: res.body, statusCode: res.statusCode, cookies, finalUrl: currentUrl };
-  }
-  throw new Error('Too many redirects');
-}
-
-function extractNonce(html, name) {
-  const match = html.match(new RegExp(`name="${name}"\\s+value="([^"]+)"`));
-  return match ? match[1] : null;
-}
-
-function cleanText(str) {
-  return str.replace(/\s+/g, ' ').replace(/&nbsp;/g, ' ').replace(/&#\d+;/g, '').trim();
-}
-
-function parseHtmlSections(html) {
-  const result = {};
-
-  // Extract text between h2 headings
-  // Find all <h2>...</h2> blocks
-  const h2Pattern = /<h2[^>]*>([\s\S]*?)<\/h2>/gi;
-  const h2Matches = [...html.matchAll(h2Pattern)];
-
-  for (let i = 0; i < h2Matches.length; i++) {
-    const heading = cleanText(h2Matches[i][1].replace(/<[^>]+>/g, ''));
-    if (!heading || heading.length > 100) continue;
-
-    // Get content between this h2 and the next h2 (or end)
-    const start = h2Matches[i].index + h2Matches[i][0].length;
-    const end = i + 1 < h2Matches.length ? h2Matches[i + 1].index : html.length;
-    const contentHtml = html.slice(start, end);
-
-    // Strip tags and clean
-    const text = cleanText(contentHtml.replace(/<[^>]+>/g, ' '));
-    if (text) result[heading] = text;
   }
 
-  return result;
+  return { resp, cookieJar };
 }
 
 async function login() {
-  if (!USERNAME || !PASSWORD) throw new Error('Credentials not configured');
+  const jar = {};
 
-  const cookies = {};
+  // GET login page → extract nonce
+  const { resp: loginResp } = await aaaFetch(`${AAA_BASE}/my-account/`, {}, jar);
+  const loginHtml = await loginResp.text();
+  const root = parse(loginHtml);
 
-  // GET login page for nonce
-  const loginPage = await fetchWithCookies(`${AAA_BASE}/my-account/`, 'GET', null, cookies);
-  const nonce = extractNonce(loginPage.body, 'woocommerce-login-nonce');
-  const referer = extractNonce(loginPage.body, '_wp_http_referer') || '/my-account/';
-  if (!nonce) throw new Error('Could not find login nonce');
+  const nonceEl = root.querySelector('input[name="woocommerce-login-nonce"]');
+  if (!nonceEl) throw new Error('Login nonce not found — site structure may have changed');
+  const nonce = nonceEl.getAttribute('value');
 
-  // POST login
-  const postData = new URLSearchParams({
+  const refererEl = root.querySelector('input[name="_wp_http_referer"]');
+  const referer = refererEl ? refererEl.getAttribute('value') : '/my-account/';
+
+  // POST credentials
+  const body = new URLSearchParams({
     username: USERNAME,
     password: PASSWORD,
     'woocommerce-login-nonce': nonce,
@@ -125,57 +75,73 @@ async function login() {
     rememberme: 'forever',
   }).toString();
 
-  await fetchWithCookies(`${AAA_BASE}/my-account/`, 'POST', postData, cookies, {
-    Referer: `${AAA_BASE}/my-account/`,
-  });
+  await aaaFetch(`${AAA_BASE}/my-account/`, {
+    method: 'POST',
+    body,
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Referer': `${AAA_BASE}/my-account/`,
+    },
+  }, jar);
 
-  return cookies;
+  return jar;
+}
+
+function cleanText(str) {
+  return str.replace(/\s+/g, ' ').replace(/\u00a0/g, ' ').trim();
+}
+
+function parseSections(root) {
+  const sections = {};
+  for (const h2 of root.querySelectorAll('h2')) {
+    const heading = cleanText(h2.text);
+    if (!heading || heading.length > 100) continue;
+    const parts = [];
+    let el = h2.nextElementSibling;
+    while (el && el.tagName !== 'H2') {
+      const t = cleanText(el.text);
+      if (t) parts.push(t);
+      el = el.nextElementSibling;
+    }
+    if (parts.length) sections[heading] = parts.join(' ');
+  }
+  return sections;
 }
 
 exports.handler = async (event) => {
-  const headers = {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-  };
+  const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' };
 
-  const url = event.queryStringParameters?.url || '';
+  const url = (event.queryStringParameters || {}).url || '';
   if (!url || !url.startsWith(`${AAA_BASE}/procedures/`)) {
     return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid URL' }) };
   }
+  if (!USERNAME || !PASSWORD) {
+    return { statusCode: 500, headers, body: JSON.stringify({ error: 'AAA_RSI_USERNAME / AAA_RSI_PASSWORD not set in environment variables' }) };
+  }
 
   try {
-    const cookies = await login();
-    const res = await fetchWithCookies(url, 'GET', null, cookies);
+    const jar = await login();
 
-    if (res.statusCode !== 200) {
-      return { statusCode: res.statusCode, headers, body: JSON.stringify({ error: `HTTP ${res.statusCode}` }) };
+    const { resp } = await aaaFetch(url, {}, jar);
+    const html = await resp.text();
+
+    if (html.includes('paid subscriber') || html.includes('woocommerce-login-nonce')) {
+      return { statusCode: 401, headers, body: JSON.stringify({ error: 'Authentication failed — verify AAA_RSI_USERNAME and AAA_RSI_PASSWORD in Netlify → Site configuration → Environment variables' }) };
     }
 
-    if (res.body.includes('paid subscriber') || res.body.includes('woocommerce-login-nonce')) {
-      return { statusCode: 401, headers, body: JSON.stringify({ error: 'Authentication failed — check credentials' }) };
-    }
+    const root = parse(html);
 
-    const sections = parseHtmlSections(res.body);
+    const titleEl = root.querySelector('h1.entry-title') || root.querySelector('h1');
+    const title = titleEl ? cleanText(titleEl.text) : '';
 
-    // Extract title
-    const titleMatch = res.body.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i)
-      || res.body.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-    const title = titleMatch ? cleanText(titleMatch[1].replace(/<[^>]+>/g, '')) : '';
-
-    // Extract size
-    const sizeMatch = res.body.match(/(\d+"[^<]*length[^<]*width)/i);
+    const sizeMatch = html.match(/(\d+"[^<"]*length[^<"]*width)/i);
     const size = sizeMatch ? cleanText(sizeMatch[1]) : '';
 
-    return {
-      statusCode: 200,
-      headers,
-      body: JSON.stringify({ title, size, sections }),
-    };
+    const sections = parseSections(root);
+
+    return { statusCode: 200, headers, body: JSON.stringify({ title, size, sections }) };
   } catch (err) {
-    return {
-      statusCode: 500,
-      headers,
-      body: JSON.stringify({ error: err.message }),
-    };
+    console.error('Error:', err.message);
+    return { statusCode: 500, headers, body: JSON.stringify({ error: err.message }) };
   }
 };
