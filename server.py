@@ -68,31 +68,112 @@ def clean_text(text):
     return text
 
 
+LOCKOUT_SKIP = {'Lockout Procedures', 'Opening Instructions', 'Lockout Primary Procedure'}
+
+
 def parse_procedure(html):
     soup = BeautifulSoup(html, 'html.parser')
-
     result = {}
 
-    # Vehicle title and size
+    # Vehicle title
     title_el = soup.find('h1', class_='entry-title') or soup.find('h1')
     if title_el:
         result['title'] = clean_text(title_el.get_text())
 
-    size_el = soup.find(string=re.compile(r'\d+".*length.*width', re.I))
-    if size_el:
-        result['size'] = clean_text(str(size_el))
+    # ── Tow procedure pictures table ──────────────────────────────
+    tow_pics_table = soup.find('table', class_='tow-procedure-pics')
+    if tow_pics_table:
+        headers = [clean_text(th.get_text()) for th in tow_pics_table.find_all('th')]
+        tow_cols = []
+        for row in tow_pics_table.find_all('tr'):
+            tds = row.find_all('td')
+            if tds:
+                for i, td in enumerate(tds):
+                    imgs = [img.get('src', '') for img in td.find_all('img') if img.get('src')]
+                    if imgs:
+                        label = headers[i] if i < len(headers) else ''
+                        tow_cols.append({'label': label, 'images': imgs})
+                break
+        if tow_cols:
+            result['towPics'] = tow_cols
 
-    # Find all h2 sections inside the article/main content
-    # The content headings are h2 tags
+    # ── Lockout structured data ───────────────────────────────────
+    lockout_div = soup.find('div', class_='lockout-procedure')
+    if lockout_div:
+        lockout = {}
+
+        # Difficulty level (e.g. L-1)
+        for strong in lockout_div.find_all('strong'):
+            txt = clean_text(strong.get_text())
+            if re.match(r'^L-\d+$', txt):
+                lockout['difficultyLevel'] = txt
+                break
+
+        # Difficulty description
+        text_left = lockout_div.find('p', class_='text-left')
+        if text_left:
+            em = text_left.find('em')
+            lockout['difficultyDesc'] = clean_text(em.get_text() if em else text_left.get_text())
+
+        # Lockout pictures (Tool | Upper View | Lower View)
+        pics_table = lockout_div.find('table', class_='lockout-pictures')
+        if pics_table:
+            pic_headers = [clean_text(th.get_text()) for th in pics_table.find_all('th')]
+            imgs = [img.get('src', '') for img in pics_table.find_all('img') if img.get('src')]
+            if imgs:
+                lockout['pictures'] = [
+                    {'label': pic_headers[i] if i < len(pic_headers) else '', 'src': imgs[i]}
+                    for i in range(len(imgs))
+                ]
+
+        # Warnings and Linkage
+        warn_table = lockout_div.find('table', class_='lockout-warning-linkage-details')
+        if warn_table:
+            for row in warn_table.find_all('tr'):
+                th = row.find('th')
+                td = row.find('td')
+                if th and td:
+                    key = clean_text(th.get_text()).lower()
+                    val = clean_text(td.get_text())
+                    if 'warning' in key:
+                        lockout['warnings'] = val
+                    elif 'linkage' in key:
+                        lockout['linkage'] = val
+
+        # Opening instructions
+        opening_h2 = None
+        for h2 in lockout_div.find_all('h2'):
+            if 'opening' in h2.get_text().lower():
+                opening_h2 = h2
+                break
+        if opening_h2:
+            parts = []
+            el = opening_h2.find_next_sibling()
+            while el and el.name != 'h2':
+                if el.name != 'table':
+                    t = clean_text(el.get_text(separator=' '))
+                    if t:
+                        parts.append(t)
+                el = el.find_next_sibling()
+            if parts:
+                lockout['openingInstructions'] = ' '.join(parts)
+
+        # Cautions
+        caution_table = lockout_div.find('table', class_='lockout-caution-details')
+        if caution_table:
+            td = caution_table.find('td')
+            if td:
+                lockout['cautions'] = clean_text(td.get_text())
+
+        if lockout:
+            result['lockout'] = lockout
+
+    # ── Regular h2 sections ───────────────────────────────────────
     sections = {}
-    all_h2 = soup.find_all('h2')
-
-    for h2 in all_h2:
+    for h2 in soup.find_all('h2'):
         heading = clean_text(h2.get_text())
-        if not heading or len(heading) > 100:
+        if not heading or len(heading) > 100 or heading in LOCKOUT_SKIP:
             continue
-
-        # Collect all content until the next h2
         content_parts = []
         el = h2.find_next_sibling()
         while el and el.name != 'h2':
@@ -100,23 +181,11 @@ def parse_procedure(html):
             if text:
                 content_parts.append(text)
             el = el.find_next_sibling()
-
         if content_parts:
             sections[heading] = ' '.join(content_parts)
 
     if sections:
         result['sections'] = sections
-
-    # Check for images (vehicle photos, diagrams)
-    imgs = []
-    for img in soup.find_all('img'):
-        src = img.get('src', '')
-        alt = img.get('alt', '')
-        if src and ('procedure' in src.lower() or 'upload' in src.lower()):
-            if not any(x in src for x in ['cbike', 'rsi-light', 'logo']):
-                imgs.append({'src': src, 'alt': alt})
-    if imgs:
-        result['images'] = imgs
 
     return result
 
@@ -134,7 +203,6 @@ def procedure():
     try:
         r = s.get(url, timeout=20)
 
-        # Check if we got bounced to login (session expired)
         if 'paid subscriber' in r.text or 'woocommerce-login-nonce' in r.text:
             print('Session expired, re-logging in...')
             with session_lock:
@@ -153,7 +221,6 @@ def procedure():
         return jsonify({'error': str(e)}), 500
 
 
-# Serve static files
 @app.route('/')
 def index():
     return send_from_directory('.', 'index.html')

@@ -116,7 +116,6 @@ async function login() {
   });
   jar = mergeCookies(jar, postRes.headers);
 
-  // Send only the two cookies Python's CookieJar sends for path=/
   const essential = {};
   for (const [k, v] of Object.entries(jar)) {
     if (k.startsWith('wordpress_logged_in_') || k === 'fakesessid') {
@@ -135,11 +134,112 @@ function cleanText(str) {
   return str.replace(/\s+/g, ' ').replace(/\u00a0/g, ' ').trim();
 }
 
-function parseSections(dom) {
+const LOCKOUT_SKIP = new Set(['Lockout Procedures', 'Opening Instructions', 'Lockout Primary Procedure']);
+
+function parseProcedure(html) {
+  const dom = parseHtml(html);
+  const result = {};
+
+  // Title
+  const titleEl = dom.querySelector('h1.entry-title') || dom.querySelector('h1');
+  if (titleEl) result.title = cleanText(titleEl.text);
+
+  // ── Tow procedure pictures table ──────────────────────────────
+  const towPicsTable = dom.querySelector('.tow-procedure-pics');
+  if (towPicsTable) {
+    const headers = towPicsTable.querySelectorAll('th').map(th => cleanText(th.text));
+    const tow_cols = [];
+    for (const row of towPicsTable.querySelectorAll('tr')) {
+      const tds = row.querySelectorAll('td');
+      if (tds.length) {
+        tds.forEach((td, i) => {
+          const imgs = td.querySelectorAll('img').map(img => img.getAttribute('src')).filter(Boolean);
+          if (imgs.length) {
+            tow_cols.push({ label: headers[i] || '', images: imgs });
+          }
+        });
+        break;
+      }
+    }
+    if (tow_cols.length) result.towPics = tow_cols;
+  }
+
+  // ── Lockout structured data ───────────────────────────────────
+  const lockoutDiv = dom.querySelector('.lockout-procedure');
+  if (lockoutDiv) {
+    const lockout = {};
+
+    // Difficulty level (e.g. L-1)
+    for (const strong of lockoutDiv.querySelectorAll('strong')) {
+      const t = cleanText(strong.text);
+      if (/^L-\d+$/.test(t)) { lockout.difficultyLevel = t; break; }
+    }
+
+    // Difficulty description
+    const textLeft = lockoutDiv.querySelector('.text-left');
+    if (textLeft) {
+      const em = textLeft.querySelector('em');
+      lockout.difficultyDesc = cleanText(em ? em.text : textLeft.text);
+    }
+
+    // Lockout pictures (Tool | Upper View | Lower View)
+    const picsTable = lockoutDiv.querySelector('.lockout-pictures');
+    if (picsTable) {
+      const picHeaders = picsTable.querySelectorAll('th').map(th => cleanText(th.text));
+      const imgs = picsTable.querySelectorAll('img').map(img => img.getAttribute('src')).filter(Boolean);
+      if (imgs.length) {
+        lockout.pictures = imgs.map((src, i) => ({ label: picHeaders[i] || '', src }));
+      }
+    }
+
+    // Warnings and Linkage
+    const warnTable = lockoutDiv.querySelector('.lockout-warning-linkage-details');
+    if (warnTable) {
+      for (const row of warnTable.querySelectorAll('tr')) {
+        const th = row.querySelector('th');
+        const td = row.querySelector('td');
+        if (th && td) {
+          const key = cleanText(th.text).toLowerCase();
+          const val = cleanText(td.text);
+          if (key.includes('warning')) lockout.warnings = val;
+          else if (key.includes('linkage')) lockout.linkage = val;
+        }
+      }
+    }
+
+    // Opening instructions
+    let openingH2 = null;
+    for (const h2 of lockoutDiv.querySelectorAll('h2')) {
+      if (h2.text.includes('Opening')) { openingH2 = h2; break; }
+    }
+    if (openingH2) {
+      const parts = [];
+      let el = openingH2.nextElementSibling;
+      while (el && el.tagName !== 'H2') {
+        if (el.tagName !== 'TABLE') {
+          const t = cleanText(el.text);
+          if (t) parts.push(t);
+        }
+        el = el.nextElementSibling;
+      }
+      if (parts.length) lockout.openingInstructions = parts.join(' ');
+    }
+
+    // Cautions
+    const cautionTable = lockoutDiv.querySelector('.lockout-caution-details');
+    if (cautionTable) {
+      const td = cautionTable.querySelector('td');
+      if (td) lockout.cautions = cleanText(td.text);
+    }
+
+    if (Object.keys(lockout).length) result.lockout = lockout;
+  }
+
+  // ── Regular h2 sections ───────────────────────────────────────
   const sections = {};
   for (const h2 of dom.querySelectorAll('h2')) {
     const heading = cleanText(h2.text);
-    if (!heading || heading.length > 100) continue;
+    if (!heading || heading.length > 100 || LOCKOUT_SKIP.has(heading)) continue;
     const parts = [];
     let el = h2.nextElementSibling;
     while (el && el.tagName !== 'H2') {
@@ -149,7 +249,9 @@ function parseSections(dom) {
     }
     if (parts.length) sections[heading] = parts.join(' ');
   }
-  return sections;
+  if (Object.keys(sections).length) result.sections = sections;
+
+  return result;
 }
 
 exports.handler = async (event) => {
@@ -182,17 +284,10 @@ exports.handler = async (event) => {
       };
     }
 
-    const dom = parseHtml(procRes.body);
-    const titleEl = dom.querySelector('h1.entry-title') || dom.querySelector('h1');
-    const title = titleEl ? cleanText(titleEl.text) : '';
-    const sizeMatch = procRes.body.match(/(\d+"[^<"]*length[^<"]*width)/i);
-    const size = sizeMatch ? cleanText(sizeMatch[1]) : '';
-    const sections = parseSections(dom);
-
     return {
       statusCode: 200,
       headers: responseHeaders,
-      body: JSON.stringify({ title, size, sections }),
+      body: JSON.stringify(parseProcedure(procRes.body)),
     };
   } catch (err) {
     console.error('Error:', err.message);
