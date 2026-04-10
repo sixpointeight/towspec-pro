@@ -8,8 +8,24 @@ const USERNAME = process.env.AAA_RSI_USERNAME || '';
 const PASSWORD = process.env.AAA_RSI_PASSWORD || '';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1';
 
-function httpsRequest(options, body = null) {
+function httpsGet(urlStr, cookieStr, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
+    const parsed = new URL(urlStr);
+    const options = {
+      hostname: parsed.hostname,
+      port: 443,
+      path: parsed.pathname + parsed.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Cookie': cookieStr,
+        ...extraHeaders,
+      },
+    };
     const req = https.request(options, (res) => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
@@ -20,105 +36,85 @@ function httpsRequest(options, body = null) {
       }));
     });
     req.on('error', reject);
-    req.setTimeout(25000, () => { req.destroy(new Error('Request timed out')); });
-    if (body) req.write(body);
+    req.setTimeout(25000, () => req.destroy(new Error('Timeout')));
     req.end();
   });
 }
 
-function extractCookies(headers) {
-  const jar = {};
-  const raw = headers['set-cookie'] || [];
-  const list = Array.isArray(raw) ? raw : [raw];
-  for (const c of list) {
-    if (!c) continue;
-    const m = c.match(/^([^=]+)=([^;]*)/);
-    if (m) jar[m[1].trim()] = m[2].trim();
-  }
-  return jar;
-}
-
-function cookieString(jar) {
-  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
-}
-
-async function aRequest(urlStr, method, postBody, cookieJar, extraHeaders = {}) {
-  const MAX_REDIRECTS = 8;
-  let currentUrl = urlStr;
-  let currentMethod = method;
-  let currentBody = postBody;
-  const trace = [];
-
-  for (let i = 0; i < MAX_REDIRECTS; i++) {
-    const parsed = new URL(currentUrl);
-    const isPost = currentMethod === 'POST' && currentBody;
-    const bodyBuf = isPost ? Buffer.from(currentBody, 'utf8') : null;
-
+function httpsPost(urlStr, postBody, cookieStr, extraHeaders = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(urlStr);
+    const buf = Buffer.from(postBody, 'utf8');
     const options = {
       hostname: parsed.hostname,
-      port: parsed.port || 443,
+      port: 443,
       path: parsed.pathname + parsed.search,
-      method: currentMethod,
+      method: 'POST',
       headers: {
         'User-Agent': UA,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Cookie': cookieString(cookieJar),
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': buf.length,
+        'Cookie': cookieStr,
         ...extraHeaders,
-        ...(isPost ? {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Content-Length': bodyBuf.length,
-        } : {}),
       },
     };
-
-    const res = await httpsRequest(options, bodyBuf);
-    const newCookies = extractCookies(res.headers);
-    Object.assign(cookieJar, newCookies);
-
-    trace.push({
-      url: currentUrl,
-      method: currentMethod,
-      status: res.statusCode,
-      newCookieKeys: Object.keys(newCookies),
-      location: res.headers['location'] || null,
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({
+        statusCode: res.statusCode,
+        headers: res.headers,
+        body: Buffer.concat(chunks).toString('utf8'),
+      }));
     });
-
-    if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-      const location = res.headers['location'];
-      if (!location) break;
-      currentUrl = new URL(location, currentUrl).toString();
-      if (res.statusCode !== 307 && res.statusCode !== 308) {
-        currentMethod = 'GET';
-        currentBody = null;
-      }
-      continue;
-    }
-
-    return { res, trace };
-  }
-  throw new Error('Too many redirects');
+    req.on('error', reject);
+    req.setTimeout(25000, () => req.destroy(new Error('Timeout')));
+    req.write(buf);
+    req.end();
+  });
 }
 
-async function login(debug = false) {
-  const jar = {};
-  const steps = [];
+// Extract all cookies from a Set-Cookie header array, respecting Max-Age=0 deletions
+function mergeCookies(existing, headers) {
+  const raw = headers['set-cookie'] || [];
+  const list = Array.isArray(raw) ? raw : [raw];
+  const updated = Object.assign({}, existing);
+  for (const c of list) {
+    if (!c) continue;
+    const nameValMatch = c.match(/^([^=]+)=([^;]*)/);
+    if (!nameValMatch) continue;
+    const name = nameValMatch[1].trim();
+    const value = nameValMatch[2].trim();
+    // Respect Max-Age=0 or expired deletions — remove the cookie
+    if (c.includes('Max-Age=0') || c.includes('max-age=0')) {
+      delete updated[name];
+    } else {
+      updated[name] = value;
+    }
+  }
+  return updated;
+}
 
-  // GET login page
-  const { res: loginRes, trace: t1 } = await aRequest(`${AAA_BASE}/my-account/`, 'GET', null, jar);
-  if (debug) steps.push({ step: 'GET login page', trace: t1, cookiesAfter: Object.keys(jar) });
+function jar2str(jar) {
+  return Object.entries(jar).map(([k, v]) => `${k}=${v}`).join('; ');
+}
 
-  const loginDom = parseHtml(loginRes.body);
-  const nonceEl = loginDom.querySelector('input[name="woocommerce-login-nonce"]');
-  if (!nonceEl) throw new Error('Login nonce not found');
+// Login and return only the cookies needed for authenticated page access
+async function login() {
+  // Step 1: GET login page
+  const loginRes = await httpsGet(`${AAA_BASE}/my-account/`, '');
+  let jar = mergeCookies({}, loginRes.headers);
+
+  const dom = parseHtml(loginRes.body);
+  const nonceEl = dom.querySelector('input[name="woocommerce-login-nonce"]');
+  if (!nonceEl) throw new Error('Login nonce not found on AAA RSI login page');
   const nonce = nonceEl.getAttribute('value');
-
-  const refEl = loginDom.querySelector('input[name="_wp_http_referer"]');
+  const refEl = dom.querySelector('input[name="_wp_http_referer"]');
   const referer = refEl ? refEl.getAttribute('value') : '/my-account/';
 
-  if (debug) steps.push({ step: 'Parsed nonce', nonceFound: true, nonceLength: nonce.length });
-
-  // POST credentials
+  // Step 2: POST credentials — do NOT follow the redirect, just capture cookies
   const body = querystring.stringify({
     username: USERNAME,
     password: PASSWORD,
@@ -128,19 +124,28 @@ async function login(debug = false) {
     rememberme: 'forever',
   });
 
-  const { res: postRes, trace: t2 } = await aRequest(`${AAA_BASE}/my-account/`, 'POST', body, jar, {
+  const postRes = await httpsPost(`${AAA_BASE}/my-account/`, body, jar2str(jar), {
     Referer: `${AAA_BASE}/my-account/`,
   });
 
-  if (debug) steps.push({
-    step: 'POST login',
-    trace: t2,
-    cookiesAfter: Object.keys(jar),
-    hasAuthCookie: Object.keys(jar).some(k => k.includes('wordpress_logged_in')),
-    finalUrl: postRes ? 'got response' : 'no response',
-  });
+  // Merge cookies from the 302 response — this is where the auth cookies arrive
+  jar = mergeCookies(jar, postRes.headers);
 
-  return { jar, steps };
+  // Only keep cookies that are actually needed:
+  // wordpress_logged_in_* (the main auth cookie, path=/) and fakesessid (path=/)
+  // Discard path-specific cookies (/wp-admin, /wp-content) and temp/switch cookies
+  const essential = {};
+  for (const [k, v] of Object.entries(jar)) {
+    if (k.startsWith('wordpress_logged_in_') || k === 'fakesessid') {
+      essential[k] = v;
+    }
+  }
+
+  if (!essential[Object.keys(essential).find(k => k.startsWith('wordpress_logged_in_'))]) {
+    throw new Error('Authentication failed — wordpress_logged_in cookie not received');
+  }
+
+  return essential;
 }
 
 function cleanText(str) {
@@ -171,37 +176,57 @@ exports.handler = async (event) => {
   };
 
   const params = event.queryStringParameters || {};
-  const isDebug = params.debug === '1';
 
-  // Debug endpoint — no credentials shown, just diagnostics
-  if (isDebug) {
+  // Debug endpoint
+  if (params.debug === '1') {
     try {
-      const { jar, steps } = await login(true);
-      const hasAuth = Object.keys(jar).some(k => k.includes('wordpress_logged_in'));
+      const loginRes = await httpsGet(`${AAA_BASE}/my-account/`, '');
+      let jar = mergeCookies({}, loginRes.headers);
+      const dom = parseHtml(loginRes.body);
+      const nonceEl = dom.querySelector('input[name="woocommerce-login-nonce"]');
+      const nonce = nonceEl ? nonceEl.getAttribute('value') : null;
+      const refEl = dom.querySelector('input[name="_wp_http_referer"]');
+      const referer = refEl ? refEl.getAttribute('value') : '/my-account/';
 
-      // Try fetching a known procedure URL
+      const postBody = querystring.stringify({
+        username: USERNAME, password: PASSWORD,
+        'woocommerce-login-nonce': nonce, '_wp_http_referer': referer,
+        login: 'Log in', rememberme: 'forever',
+      });
+      const postRes = await httpsPost(`${AAA_BASE}/my-account/`, postBody, jar2str(jar), {
+        Referer: `${AAA_BASE}/my-account/`,
+      });
+      jar = mergeCookies(jar, postRes.headers);
+
+      // Filter to essential
+      const essential = {};
+      for (const [k, v] of Object.entries(jar)) {
+        if (k.startsWith('wordpress_logged_in_') || k === 'fakesessid') essential[k] = v;
+      }
+
       const testUrl = `${AAA_BASE}/procedures/2025/Tesla/Model-3/RWD/Electric/2025-tesla-model-3-rwd-2/`;
-      const { res: procRes, trace: t3 } = await aRequest(testUrl, 'GET', null, jar);
-      const isPaywalled = procRes.body.includes('paid subscriber') || procRes.body.includes('woocommerce-login-nonce');
-      const hasTowInfo = procRes.body.includes('Tow Information');
+      const procRes = await httpsGet(testUrl, jar2str(essential), {
+        Referer: `${AAA_BASE}/procedures/`,
+      });
 
       return {
         statusCode: 200,
         headers: responseHeaders,
         body: JSON.stringify({
           envVarsSet: { username: !!USERNAME, password: !!PASSWORD },
-          loginSteps: steps,
-          cookieCount: Object.keys(jar).length,
-          hasAuthCookie: hasAuth,
-          procedureCheck: { trace: t3, isPaywalled, hasTowInfo, statusCode: procRes.statusCode },
+          nonceFound: !!nonce,
+          postStatus: postRes.statusCode,
+          allCookieCount: Object.keys(jar).length,
+          essentialCookies: Object.keys(essential),
+          essentialCookieValueLengths: Object.fromEntries(Object.entries(essential).map(([k,v]) => [k, v.length])),
+          procedureStatus: procRes.statusCode,
+          isPaywalled: procRes.body.includes('paid subscriber') || procRes.body.includes('woocommerce-login-nonce'),
+          hasTowInfo: procRes.body.includes('Tow Information'),
+          bodySnippet: procRes.body.slice(0, 300).replace(/\s+/g,' '),
         }, null, 2),
       };
     } catch (err) {
-      return {
-        statusCode: 500,
-        headers: responseHeaders,
-        body: JSON.stringify({ debugError: err.message, stack: err.stack }),
-      };
+      return { statusCode: 500, headers: responseHeaders, body: JSON.stringify({ debugError: err.message }) };
     }
   }
 
@@ -214,10 +239,12 @@ exports.handler = async (event) => {
   }
 
   try {
-    const { jar } = await login(false);
-    const { res: procedureRes } = await aRequest(url, 'GET', null, jar);
+    const essential = await login();
+    const procRes = await httpsGet(url, jar2str(essential), {
+      Referer: `${AAA_BASE}/procedures/`,
+    });
 
-    if (procedureRes.body.includes('paid subscriber') || procedureRes.body.includes('woocommerce-login-nonce')) {
+    if (procRes.body.includes('paid subscriber') || procRes.body.includes('woocommerce-login-nonce')) {
       return {
         statusCode: 401,
         headers: responseHeaders,
@@ -225,10 +252,10 @@ exports.handler = async (event) => {
       };
     }
 
-    const dom = parseHtml(procedureRes.body);
+    const dom = parseHtml(procRes.body);
     const titleEl = dom.querySelector('h1.entry-title') || dom.querySelector('h1');
     const title = titleEl ? cleanText(titleEl.text) : '';
-    const sizeMatch = procedureRes.body.match(/(\d+"[^<"]*length[^<"]*width)/i);
+    const sizeMatch = procRes.body.match(/(\d+"[^<"]*length[^<"]*width)/i);
     const size = sizeMatch ? cleanText(sizeMatch[1]) : '';
     const sections = parseSections(dom);
 
