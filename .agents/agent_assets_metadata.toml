@@ -1,0 +1,8 @@
+uploads = []
+outputs = []
+
+[[generated]]
+id = "YMsaS-x-owmOuadQTAVyw"
+uri = "file://mobile/assets/images/icon.png"
+type = "image"
+title = "towspec pro app icon"
