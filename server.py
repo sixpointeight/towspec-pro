@@ -8,6 +8,19 @@ from bs4 import BeautifulSoup
 
 app = Flask(__name__, static_folder='.')
 
+# ── CORS (needed for Expo mobile app) ─────────────────────────────────────────
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    return response
+
+@app.route('/api/search', methods=['OPTIONS'])
+@app.route('/api/procedure', methods=['OPTIONS'])
+def options_handler():
+    return '', 204
+
 AAA_BASE = 'https://rsi.aaa.biz'
 USERNAME = os.environ.get('AAA_RSI_USERNAME', '')
 PASSWORD = os.environ.get('AAA_RSI_PASSWORD', '')
@@ -188,6 +201,58 @@ def parse_procedure(html):
         result['sections'] = sections
 
     return result
+
+
+_vehicles_db: list | None = None
+_vehicles_lock = threading.Lock()
+
+def get_vehicles_db():
+    global _vehicles_db
+    with _vehicles_lock:
+        if _vehicles_db is None:
+            try:
+                with open('vehicles.json', 'r') as f:
+                    _vehicles_db = json.load(f)
+                print(f'Loaded {len(_vehicles_db)} vehicles into memory')
+            except Exception as e:
+                print(f'Failed to load vehicles.json: {e}')
+                _vehicles_db = []
+    return _vehicles_db
+
+
+@app.route('/api/search')
+def search():
+    year_str = request.args.get('year', '').strip()
+    make = request.args.get('make', '').strip().lower()
+    model = request.args.get('model', '').strip().lower()
+
+    if not year_str or not make or not model:
+        return jsonify({'error': 'year, make, and model are required'}), 400
+
+    try:
+        year = int(year_str)
+    except ValueError:
+        return jsonify({'error': 'year must be a number'}), 400
+
+    db = get_vehicles_db()
+
+    def normalize(s):
+        return re.sub(r'[^a-z0-9]', '', s.lower())
+
+    make_n = normalize(make)
+    model_n = normalize(model)
+
+    results = []
+    for v in db:
+        if v.get('year') != year:
+            continue
+        if normalize(v.get('make', '')) != make_n:
+            continue
+        v_model = normalize(v.get('model', ''))
+        if v_model == model_n or model_n in v_model or v_model in model_n:
+            results.append(v)
+
+    return jsonify(results)
 
 
 @app.route('/api/procedure')
